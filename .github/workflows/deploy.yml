@@ -1,102 +1,55 @@
 name: Deploy to Production
-
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    env:
-      # --- required secrets ---
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      EC2_HOST: ${{ secrets.EC2_HOST }}
-      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-      # --- repo to clone on EC2 ---
-      REPO: ${{ github.repository }}
-
-    steps:
-      - name: Checkout (establish $GITHUB_* envs)
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      - name: Deploy to EC2 via SSH (Compose v2, non-interactive)
-        env:
-          HOST: ${{ env.EC2_HOST }}
-          USER: ubuntu
-          PRIVATE_KEY: ${{ env.EC2_SSH_KEY }}
-          REPO: ${{ env.REPO }}
-          DOCKER_USERNAME: ${{ env.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ env.DOCKER_PASSWORD }}
-        run: |
-          set -euo pipefail
-          echo "$PRIVATE_KEY" > private_key.pem
-          chmod 600 private_key.pem
-
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << 'EOF'
-            set -euxo pipefail
-
-            # --- 1) Ensure Docker is installed and running ---
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo apt-get install -y docker.io
-              sudo systemctl enable --now docker
-            fi
-
-            # --- 2) Ensure Docker Compose v2 (apt first; fallback to GitHub binary) ---
-            if ! docker compose version >/dev/null 2>&1; then
-              echo "Installing Docker Compose v2..."
-              sudo apt-get update
-              if sudo apt-get install -y docker-compose-plugin; then
-                echo "Compose v2 installed via apt."
-              else
-                echo "apt install failed; installing Compose from GitHub release…"
-                COMPOSE_VERSION="v2.29.7"
-                sudo mkdir -p /usr/local/lib/docker/cli-plugins
-                sudo curl -fsSL \
-                  "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
-                  -o /usr/local/lib/docker/cli-plugins/docker-compose
-                sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-              fi
-            fi
-
-            # --- 3) Get/Update app repo on the instance ---
-            cd /home/ubuntu
-            if [ ! -d app/.git ]; then
-              git clone https://github.com/${REPO}.git app
-            fi
-            cd app
-            git pull origin main
-
-            # --- 4) (Optional) Docker Hub login if creds provided (private repos) ---
-            if [ -n "${DOCKER_USERNAME:-}" ] && [ -n "${DOCKER_PASSWORD:-}" ]; then
-              echo "${DOCKER_PASSWORD}" | sudo docker login -u "${DOCKER_USERNAME}" --password-stdin || true
-            fi
-
-            # --- 5) Compose v2 deploy — non-interactive, idempotent ---
-            sudo docker compose down --remove-orphans || true
-            sudo docker compose pull || true
-            sudo docker compose up -d --force-recreate --remove-orphans
-            sudo docker system prune -af || true
-
-            # --- 6) Local health check on host port 80 ---
-            curl -fsS http://localhost/health
-          EOF
-
-          rm -f private_key.pem
-
-      - name: Verify deployment from runner (public)
-        run: |
-          set -euxo pipefail
-          sleep 5
-          curl -fsS http://${{ env.EC2_HOST }}/health
+ ​
+ on:
+   push:
+     branches: [ main ]
+   workflow_dispatch:
+ ​
+ jobs:
+   deploy:
+     runs-on: ubuntu-latest
+     
+     steps:
+     - name: Checkout code
+       uses: actions/checkout@v3
+     
+     - name: Configure AWS credentials
+       uses: aws-actions/configure-aws-credentials@v2
+       with:
+         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+         aws-region: us-east-1
+     
+     - name: Deploy to EC2
+       env:
+         PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+         HOST: ${{ secrets.EC2_HOST }}
+         USER: ubuntu
+       run: |
+         echo "$PRIVATE_KEY" > private_key.pem
+         chmod 600 private_key.pem
+         
+         ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << 'EOF'
+           cd /home/ubuntu/app
+           git pull origin main
+           docker-compose down
+           docker-compose pull
+           docker-compose up -d
+           docker system prune -af
+         EOF
+         
+         rm -f private_key.pem
+     
+     - name: Verify deployment
+       run: |
+         sleep 10
+         curl -f http://${{ secrets.EC2_HOST }}/health || exit 1
+     
+     - name: Notify deployment
+       if: always()
+       run: |
+         if [ ${{ job.status }} == 'success' ]; then
+           echo "✅ Deployment successful!"
+         else
+           echo "❌ Deployment failed!"
+         fi
