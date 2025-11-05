@@ -1,63 +1,109 @@
-- name: Deploy to EC2 via SSH (Compose v2, non-interactive)
-  env:
-    HOST: ${{ secrets.EC2_HOST }}
-    USER: ubuntu
-    PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
-    REPO: ${{ github.repository }}
-    DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-    DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-  run: |
-    set -euo pipefail
-    echo "$PRIVATE_KEY" > private_key.pem
-    chmod 600 private_key.pem
+name: Deploy to Production
 
-    ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << 'EOF'
-      set -euxo pipefail
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
-      # 1) Ensure Docker running
-      if ! command -v docker >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo apt-get install -y docker.io
-        sudo systemctl enable --now docker
-      fi
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
 
-      # 2) Ensure Compose v2 (use sudo for all docker calls)
-      if ! sudo docker compose version >/dev/null 2>&1; then
-        echo "Installing Docker Compose v2…"
-        sudo apt-get update || true
-        if sudo apt-get install -y docker-compose-plugin; then
-          :
-        else
-          COMPOSE_VERSION="v2.29.7"
-          sudo mkdir -p /usr/local/lib/docker/cli-plugins
-          sudo curl -fsSL \
-            "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
-            -o /usr/local/lib/docker/cli-plugins/docker-compose
-          sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-        fi
-      fi
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # 3) Get/Update repo
-      cd /home/ubuntu
-      if [ ! -d app/.git ]; then
-        git clone https://github.com/${REPO}.git app
-      fi
-      cd app
-      git pull origin main
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
 
-      # 4) Login to Docker Hub if secrets are set (optional)
-      if [ -n "${DOCKER_USERNAME:-}" ] && [ -n "${DOCKER_PASSWORD:-}" ]; then
-        echo "${DOCKER_PASSWORD}" | sudo docker login -u "${DOCKER_USERNAME}" --password-stdin || true
-      fi
+      - name: Deploy to EC2 via SSH (Compose v2, non-interactive)
+        env:
+          HOST: ${{ secrets.EC2_HOST }}
+          USER: ubuntu
+          PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          REPO: ${{ github.repository }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
 
-      # 5) Compose deploy (all with sudo)
-      sudo docker compose down --remove-orphans || true
-      sudo docker compose pull || true
-      sudo docker compose up -d --force-recreate --remove-orphans
-      sudo docker system prune -af || true
+          # NOTE: unquoted EOF so ${REPO} expands here on the runner
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << EOF
+            set -euxo pipefail
 
-      # 6) Health check
-      curl -fsS http://localhost/health
-    EOF
+            # 1) Ensure Docker
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y docker.io
+              sudo systemctl enable --now docker
+            fi
 
-    rm -f private_key.pem
+            # 2) Ensure Compose v2 (use sudo for checks/calls)
+            if ! sudo docker compose version >/dev/null 2>&1; then
+              echo "Installing Docker Compose v2…"
+              sudo apt-get update || true
+              if sudo apt-get install -y docker-compose-plugin; then
+                :
+              else
+                COMPOSE_VERSION="v2.29.7"
+                sudo mkdir -p /usr/local/lib/docker/cli-plugins
+                sudo curl -fsSL \
+                  "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+                  -o /usr/local/lib/docker/cli-plugins/docker-compose
+                sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              fi
+            fi
+
+            # 3) Get/Update app repo
+            cd /home/ubuntu
+            if [ ! -d app/.git ]; then
+              git clone https://github.com/${REPO}.git app
+            fi
+            cd app
+            git pull origin main
+
+            # 4) Optional: login if your Docker Hub repo is private
+            if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
+              echo "${DOCKER_PASSWORD}" | sudo docker login -u "${DOCKER_USERNAME}" --password-stdin || true
+            fi
+
+            # 5) Compose deploy (all with sudo)
+            sudo docker compose down --remove-orphans || true
+            sudo docker compose pull || true
+            sudo docker compose up -d --force-recreate --remove-orphans
+            sudo docker system prune -af || true
+
+            # 6) Local health probe (allow warmup)
+            for i in {1..30}; do
+              if curl -fsS http://localhost/health >/dev/null; then
+                echo "Local health OK"
+                exit 0
+              fi
+              echo "…waiting for app ($i/30)"
+              sleep 2
+            done
+            echo "Local health check failed"
+            exit 1
+          EOF
+
+          rm -f private_key.pem
+
+      - name: Verify deployment from runner (public)
+        run: |
+          set -e
+          for i in {1..30}; do
+            if curl -fsS "http://${{ secrets.EC2_HOST }}/health" >/dev/null; then
+              echo "✅ Public health OK"
+              exit 0
+            fi
+            echo "…waiting for public /health ($i/30)"
+            sleep 2
+          done
+          echo "❌ Public health check failed"
+          exit 1
