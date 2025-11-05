@@ -9,60 +9,75 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
-      HOST: ${{ secrets.EC2_HOST }}
-      USER: ubuntu
-      REPO: ${{ github.repository }}  # e.g., kalyani-25/fastapi-cicd
+      # --- required secrets ---
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      # --- repo to clone on EC2 ---
+      REPO: ${{ github.repository }}
+
     steps:
-      - name: Checkout code
+      - name: Checkout (for $GITHUB_REPOSITORY var only)
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Deploy to EC2 via SSH and docker compose
+      - name: Deploy to EC2 via SSH (docker compose v2, non-interactive)
+        env:
+          HOST: ${{ env.EC2_HOST }}
+          USER: ubuntu
+          PRIVATE_KEY: ${{ env.EC2_SSH_KEY }}
         run: |
+          set -euo pipefail
           echo "$PRIVATE_KEY" > private_key.pem
           chmod 600 private_key.pem
 
           ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << EOF
-            set -e
-
-            cd /home/ubuntu
-            if [ ! -d "app/.git" ]; then
-              git clone https://github.com/${REPO}.git app
-            fi
-
-            cd app
-            git pull origin main
-
-            # Ensure Docker & Compose
+            set -euxo pipefail
+            # 1) Ensure Docker + Compose v2
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update
               sudo apt-get install -y docker.io
               sudo systemctl enable --now docker
             fi
-
-            if ! command -v docker-compose >/dev/null 2>&1; then
-              sudo apt-get install -y docker-compose
+            if ! docker compose version >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y docker-compose-plugin
             fi
 
-            # Compose deploy
-            sudo docker-compose down || true
-            sudo docker-compose pull || true
-            sudo docker-compose up -d
+            # 2) Get/Update app repo
+            cd /home/ubuntu
+            if [ ! -d app/.git ]; then
+              git clone https://github.com/${REPO}.git app
+            fi
+            cd app
+            git pull origin main
 
-            # Clean up dangling layers (non-fatal)
+            # 3) (Optional) login if your Docker Hub repo is private
+            echo "${DOCKER_PASSWORD}" | sudo docker login -u "${DOCKER_USERNAME}" --password-stdin || true
+
+            # 4) Compose v2 deploy — NO interactive prompts
+            sudo docker compose down --remove-orphans || true
+            sudo docker compose pull || true
+            sudo docker compose up -d --force-recreate --remove-orphans
             sudo docker system prune -af || true
+
+            # 5) Local health check on host port 80
+            curl -fsS http://localhost/health
           EOF
 
           rm -f private_key.pem
 
-      - name: Verify deployment
+      - name: Verify deployment from runner
         run: |
-          sleep 10
-          curl -f http://${{ secrets.EC2_HOST }}/health
+          set -euxo pipefail
+          sleep 5
+          curl -fsS http://${{ env.EC2_HOST }}/health
