@@ -20,7 +20,7 @@ jobs:
       REPO: ${{ github.repository }}
 
     steps:
-      - name: Checkout (for $GITHUB_REPOSITORY var only)
+      - name: Checkout (establish $GITHUB_* envs)
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials
@@ -30,30 +30,47 @@ jobs:
           aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Deploy to EC2 via SSH (docker compose v2, non-interactive)
+      - name: Deploy to EC2 via SSH (Compose v2, non-interactive)
         env:
           HOST: ${{ env.EC2_HOST }}
           USER: ubuntu
           PRIVATE_KEY: ${{ env.EC2_SSH_KEY }}
+          REPO: ${{ env.REPO }}
+          DOCKER_USERNAME: ${{ env.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ env.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
           echo "$PRIVATE_KEY" > private_key.pem
           chmod 600 private_key.pem
 
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << EOF
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << 'EOF'
             set -euxo pipefail
-            # 1) Ensure Docker + Compose v2
+
+            # --- 1) Ensure Docker is installed and running ---
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update
               sudo apt-get install -y docker.io
               sudo systemctl enable --now docker
             fi
+
+            # --- 2) Ensure Docker Compose v2 (apt first; fallback to GitHub binary) ---
             if ! docker compose version >/dev/null 2>&1; then
+              echo "Installing Docker Compose v2..."
               sudo apt-get update
-              sudo apt-get install -y docker-compose-plugin
+              if sudo apt-get install -y docker-compose-plugin; then
+                echo "Compose v2 installed via apt."
+              else
+                echo "apt install failed; installing Compose from GitHub release…"
+                COMPOSE_VERSION="v2.29.7"
+                sudo mkdir -p /usr/local/lib/docker/cli-plugins
+                sudo curl -fsSL \
+                  "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+                  -o /usr/local/lib/docker/cli-plugins/docker-compose
+                sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              fi
             fi
 
-            # 2) Get/Update app repo
+            # --- 3) Get/Update app repo on the instance ---
             cd /home/ubuntu
             if [ ! -d app/.git ]; then
               git clone https://github.com/${REPO}.git app
@@ -61,22 +78,24 @@ jobs:
             cd app
             git pull origin main
 
-            # 3) (Optional) login if your Docker Hub repo is private
-            echo "${DOCKER_PASSWORD}" | sudo docker login -u "${DOCKER_USERNAME}" --password-stdin || true
+            # --- 4) (Optional) Docker Hub login if creds provided (private repos) ---
+            if [ -n "${DOCKER_USERNAME:-}" ] && [ -n "${DOCKER_PASSWORD:-}" ]; then
+              echo "${DOCKER_PASSWORD}" | sudo docker login -u "${DOCKER_USERNAME}" --password-stdin || true
+            fi
 
-            # 4) Compose v2 deploy — NO interactive prompts
+            # --- 5) Compose v2 deploy — non-interactive, idempotent ---
             sudo docker compose down --remove-orphans || true
             sudo docker compose pull || true
             sudo docker compose up -d --force-recreate --remove-orphans
             sudo docker system prune -af || true
 
-            # 5) Local health check on host port 80
+            # --- 6) Local health check on host port 80 ---
             curl -fsS http://localhost/health
           EOF
 
           rm -f private_key.pem
 
-      - name: Verify deployment from runner
+      - name: Verify deployment from runner (public)
         run: |
           set -euxo pipefail
           sleep 5
