@@ -33,9 +33,15 @@ jobs:
           echo "$PRIVATE_KEY" > private_key.pem
           chmod 600 private_key.pem
 
-          # NOTE: unquoted EOF so ${REPO} expands here on the runner
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << EOF
+          # Use a quoted heredoc so nothing expands on the runner
+          # Pass values into the remote shell via environment.
+          set +e
+          SSH_CMD=$(cat <<'EOF'
             set -euxo pipefail
+
+            export REPO="${REPO}"
+            export DOCKER_USERNAME="${DOCKER_USERNAME:-}"
+            export DOCKER_PASSWORD="${DOCKER_PASSWORD:-}"
 
             # 1) Ensure Docker
             if ! command -v docker >/dev/null 2>&1; then
@@ -44,14 +50,14 @@ jobs:
               sudo systemctl enable --now docker
             fi
 
-            # 2) Ensure Compose v2 (all docker calls via sudo)
+            # 2) Ensure Compose v2 (use sudo for compose)
             if ! sudo docker compose version >/dev/null 2>&1; then
               echo "Installing Docker Compose v2…"
               sudo apt-get update || true
               if sudo apt-get install -y docker-compose-plugin; then
                 :
               else
-                # Hard-code release to avoid runner-side var expansion issues
+                # Fallback: download static binary
                 sudo mkdir -p /usr/local/lib/docker/cli-plugins
                 sudo curl -fsSL \
                   "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
@@ -60,10 +66,10 @@ jobs:
               fi
             fi
 
-            # 3) Get/Update app repo
+            # 3) Get/Update repo
             cd /home/ubuntu
             if [ ! -d app/.git ]; then
-              git clone https://github.com/${REPO}.git app
+              git clone "https://github.com/${REPO}.git" app
             fi
             cd app
             git pull origin main
@@ -73,31 +79,40 @@ jobs:
               echo "${DOCKER_PASSWORD}" | sudo docker login -u "${DOCKER_USERNAME}" --password-stdin || true
             fi
 
-            # 5) Deploy
+            # 5) Deploy with compose
             sudo docker compose down --remove-orphans || true
             sudo docker compose pull || true
             sudo docker compose up -d --force-recreate --remove-orphans
             sudo docker system prune -af || true
 
-            # 6) Local health check (warmup)
-            for i in {1..30}; do
+            # 6) Local health check (allow warmup)
+            for i in $(seq 1 30); do
               if curl -fsS http://localhost/health >/dev/null; then
                 echo "Local health OK"
                 exit 0
               fi
-              echo "…waiting for app (\$i/30)"
+              echo "…waiting for app ($i/30)"
               sleep 2
             done
             echo "Local health check failed"
             exit 1
           EOF
-
+          )
+          # Run the SSH with env passed in; capture exit code but don't fail this step
+          ssh -o StrictHostKeyChecking=no -i private_key.pem \
+            -o LogLevel=ERROR \
+            ${USER}@${HOST} \
+            REPO="${REPO}" DOCKER_USERNAME="${DOCKER_USERNAME}" DOCKER_PASSWORD="${DOCKER_PASSWORD}" \
+            "bash -lc '${SSH_CMD//\'/\'\"\'\"\'}'"
+          rc=$?
+          set -e
+          echo "SSH finished with code: $rc (continuing; public verify will decide pass/fail)"
           rm -f private_key.pem
 
       - name: Verify deployment from runner (public)
         run: |
           set -e
-          for i in {1..30}; do
+          for i in $(seq 1 30); do
             if curl -fsS "http://${{ secrets.EC2_HOST }}/health" >/dev/null; then
               echo "✅ Public health OK"
               exit 0
