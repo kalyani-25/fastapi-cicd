@@ -8,6 +8,11 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+      HOST: ${{ secrets.EC2_HOST }}
+      USER: ubuntu
+      REPO: ${{ github.repository }}  # e.g., kalyani-25/fastapi-cicd
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,30 +25,40 @@ jobs:
           aws-region: us-east-1
 
       - name: Deploy to EC2 via SSH and docker compose
-        env:
-          PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
-          HOST: ${{ secrets.EC2_HOST }}
-          USER: ubuntu
         run: |
           echo "$PRIVATE_KEY" > private_key.pem
           chmod 600 private_key.pem
 
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << 'EOF2'
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << EOF
             set -e
-            if [ ! -d "/home/ubuntu/app" ]; then
-              cd /home/ubuntu
-              git clone https://github.com/${GITHUB_REPOSITORY}.git app
+
+            cd /home/ubuntu
+            if [ ! -d "app/.git" ]; then
+              git clone https://github.com/${REPO}.git app
             fi
-            cd /home/ubuntu/app
+
+            cd app
             git pull origin main
-            docker --version || sudo apt-get update && sudo apt-get install -y docker.io
-            command -v docker-compose >/dev/null 2>&1 || sudo apt-get install -y docker-compose
-            sudo systemctl enable --now docker || true
-            docker-compose down || true
-            docker-compose pull || true
-            docker-compose up -d
-            docker system prune -af || true
-          EOF2
+
+            # Ensure Docker & Compose
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y docker.io
+              sudo systemctl enable --now docker
+            fi
+
+            if ! command -v docker-compose >/dev/null 2>&1; then
+              sudo apt-get install -y docker-compose
+            fi
+
+            # Compose deploy
+            sudo docker-compose down || true
+            sudo docker-compose pull || true
+            sudo docker-compose up -d
+
+            # Clean up dangling layers (non-fatal)
+            sudo docker system prune -af || true
+          EOF
 
           rm -f private_key.pem
 
