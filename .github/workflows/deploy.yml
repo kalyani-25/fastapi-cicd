@@ -1,3 +1,25 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
       - name: Deploy to EC2 via SSH (Compose v2, non-interactive)
         env:
           HOST: ${{ secrets.EC2_HOST }}
@@ -11,6 +33,7 @@
           echo "$PRIVATE_KEY" > private_key.pem
           chmod 600 private_key.pem
 
+          # NOTE: unquoted EOF so ${REPO} expands here on the runner
           ssh -o StrictHostKeyChecking=no -i private_key.pem ${USER}@${HOST} << EOF
             set -euxo pipefail
 
@@ -21,14 +44,14 @@
               sudo systemctl enable --now docker
             fi
 
-            # 2) Ensure Compose v2 (use sudo for checks/calls)
+            # 2) Ensure Compose v2 (all docker calls via sudo)
             if ! sudo docker compose version >/dev/null 2>&1; then
               echo "Installing Docker Compose v2…"
               sudo apt-get update || true
               if sudo apt-get install -y docker-compose-plugin; then
                 :
               else
-                # Hard-code version to avoid runner-side expansion issues
+                # Hard-code release to avoid runner-side var expansion issues
                 sudo mkdir -p /usr/local/lib/docker/cli-plugins
                 sudo curl -fsSL \
                   "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
@@ -56,7 +79,7 @@
             sudo docker compose up -d --force-recreate --remove-orphans
             sudo docker system prune -af || true
 
-            # 6) Local health check
+            # 6) Local health check (warmup)
             for i in {1..30}; do
               if curl -fsS http://localhost/health >/dev/null; then
                 echo "Local health OK"
@@ -70,3 +93,17 @@
           EOF
 
           rm -f private_key.pem
+
+      - name: Verify deployment from runner (public)
+        run: |
+          set -e
+          for i in {1..30}; do
+            if curl -fsS "http://${{ secrets.EC2_HOST }}/health" >/dev/null; then
+              echo "✅ Public health OK"
+              exit 0
+            fi
+            echo "…waiting for public /health ($i/30)"
+            sleep 2
+          done
+          echo "❌ Public health check failed"
+          exit 1
