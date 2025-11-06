@@ -52,7 +52,7 @@ jobs:
 
             # 2) Ensure Compose v2 (use sudo for compose)
             if ! sudo docker compose version >/dev/null 2>&1; then
-              echo "Installing Docker Compose v2…"
+              echo "Installing Docker Compose v2..."
               sudo apt-get update || true
               if sudo apt-get install -y docker-compose-plugin; then
                 :
@@ -91,7 +91,7 @@ jobs:
                 echo "Local health OK"
                 exit 0
               fi
-              echo "…waiting for app ($i/30)"
+              echo "...waiting for app ($i/30)"
               sleep 2
             done
             echo "Local health check failed"
@@ -114,11 +114,70 @@ jobs:
           set -e
           for i in $(seq 1 30); do
             if curl -fsS "http://${{ secrets.EC2_HOST }}/health" >/dev/null; then
-              echo "✅ Public health OK"
+              echo "Public health OK"
               exit 0
             fi
-            echo "…waiting for public /health ($i/30)"
+            echo "...waiting for public /health ($i/30)"
             sleep 2
           done
-          echo "❌ Public health check failed"
+          echo "Public health check failed"
           exit 1
+
+      # ===== Notifications via GitHub Issue (shows in GitHub bell + email) =====
+      - name: Notify (success -> open issue)
+        if: ${{ success() }}
+        uses: actions/github-script@v7
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const sha = process.env.GITHUB_SHA || "";
+            const shortSha = sha.substring(0, 7);
+            const lines = [
+              `Deployment succeeded`,
+              `Repo: ${context.repo.owner}/${context.repo.repo}`,
+              `Commit: ${sha}`,
+              `Host: http://${process.env.EC2_HOST}/health`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            ];
+            const title = `Deploy succeeded: ${shortSha}`;
+            const body = lines.join('\n');
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              assignees: [context.actor]
+            });
+            core.info(`Opened issue #${issue.number}`);
+
+      - name: Notify (failure -> open issue)
+        if: ${{ failure() }}
+        uses: actions/github-script@v7
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const sha = process.env.GITHUB_SHA || "";
+            const shortSha = sha.substring(0, 7);
+            const lines = [
+              `Deployment failed`,
+              `Repo: ${context.repo.owner}/${context.repo.repo}`,
+              `Commit: ${sha}`,
+              `Host: http://${process.env.EC2_HOST}/health`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              'Check the workflow logs for details.'
+            ];
+            const title = `Deploy failed: ${shortSha}`;
+            const body = lines.join('\n');
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              assignees: [context.actor]
+            });
+            core.info(`Opened issue #${issue.number}`);
