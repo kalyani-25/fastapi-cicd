@@ -122,3 +122,51 @@ jobs:
           done
           echo "❌ Public health check failed"
           exit 1
+
+      - name: Notify (success → open issue & assign me)
+        if: ${{ success() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const title = `✅ Deploy succeeded: ${process.env.GITHUB_SHA.substring(0,7)}`;
+            const body = [
+              "Deployed to EC2 successfully.",
+              "",
+              `- Repo: ${process.env.GITHUB_REPOSITORY}`,
+              `- Commit: ${process.env.GITHUB_SHA}`,
+              `- Health: http://${process.env.EC2_HOST || "your-ec2-host"}/health`
+            ].join("\n");
+            const issue = await github.rest.issues.create({
+              owner, repo,
+              title,
+              body,
+              assignees: ["kalyani-25"],
+              labels: ["deployment","success"]
+            });
+            core.info(\`Opened issue #\${issue.data.number}\`);
+
+      - name: Notify (failure → open issue & assign me)
+        if: ${{ failure() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const title = `❌ Deploy failed: ${process.env.GITHUB_SHA.substring(0,7)}`;
+            const body = [
+              "Deployment failed.",
+              "",
+              `- Repo: ${process.env.GITHUB_REPOSITORY}`,
+              `- Commit: ${process.env.GITHUB_SHA}`,
+              `- Health: http://${process.env.EC2_HOST || "your-ec2-host"}/health`,
+              "",
+              "Check GitHub Actions logs for details."
+            ].join("\n");
+            const issue = await github.rest.issues.create({
+              owner, repo,
+              title,
+              body,
+              assignees: ["kalyani-25"],
+              labels: ["deployment","failure"]
+            });
+            core.info(\`Opened issue #\${issue.data.number}\`);
